@@ -372,7 +372,7 @@ async def enrich_routes_with_elevation(
     client: Optional[httpx.AsyncClient] = None,
     names: Optional[List[str]] = None,
     source: str = "generated",
-    max_routes: int = 8,  # Reduced for faster processing
+    max_routes: int = 6,  # Further reduced since we generate better candidates now
 ) -> List[RouteWithElevation]:
     """Add elevation data to a list of routes using batched API calls.
 

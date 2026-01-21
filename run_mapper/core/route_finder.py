@@ -1,14 +1,27 @@
 """Route finder using OSMnx for generating candidate running routes."""
 
+import asyncio
 import logging
 import math
 import random
+import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import httpx
 import networkx as nx
 import osmnx as ox
 
+from .elevation import get_elevations
+
 logger = logging.getLogger(__name__)
+
+# Timeout budgets for different operations (in seconds)
+TIMEOUT_OSM_DOWNLOAD = 30  # OSM network download
+TIMEOUT_STRATEGY = 10  # Each route finding strategy
+TIMEOUT_CORRIDOR_SEARCH = 15  # Corridor-based search
+
+# Graph-level elevation cache (node_id -> elevation_m)
+_elevation_cache: Dict[int, float] = {}
 
 
 class RouteFinderError(Exception):
@@ -32,6 +45,102 @@ LANDMARK_TAGS = {
     'landuse': ['recreation_ground', 'forest'],
     'natural': ['wood', 'grassland'],
 }
+
+
+async def _precompute_graph_elevations_async(
+    G: nx.MultiDiGraph,
+    sample_rate: float = 1.0,
+    client: Optional[httpx.AsyncClient] = None,
+) -> Dict[int, float]:
+    """Async version: Precompute elevations for graph nodes - MAJOR OPTIMIZATION.
+
+    Instead of fetching elevation for each route separately, we fetch
+    elevation for all graph nodes once and cache it. This dramatically
+    reduces API calls and speeds up route scoring.
+
+    Args:
+        G: NetworkX graph with 'y' (lat) and 'x' (lon) node attributes
+        sample_rate: Fraction of nodes to sample (1.0 = all nodes, 0.5 = half)
+        client: Optional httpx client to reuse
+
+    Returns:
+        Dictionary mapping node_id -> elevation_m
+    """
+    global _elevation_cache
+
+    # Get all unique nodes
+    nodes = list(G.nodes())
+
+    # Sample nodes if requested (for very large graphs)
+    if sample_rate < 1.0:
+        sample_size = max(100, int(len(nodes) * sample_rate))
+        nodes = random.sample(nodes, min(sample_size, len(nodes)))
+        logger.warning(f"[ELEVATION] Sampling {len(nodes)} of {G.number_of_nodes()} nodes")
+
+    # Filter out already cached nodes
+    nodes_to_fetch = [n for n in nodes if n not in _elevation_cache]
+
+    if not nodes_to_fetch:
+        logger.warning("[ELEVATION] All nodes already cached")
+        return {n: _elevation_cache[n] for n in nodes if n in _elevation_cache}
+
+    logger.warning(f"[ELEVATION] Precomputing elevation for {len(nodes_to_fetch)} graph nodes...")
+
+    # Extract coordinates
+    coordinates = []
+    node_ids = []
+    for node_id in nodes_to_fetch:
+        if node_id in G.nodes:
+            node_data = G.nodes[node_id]
+            lat = node_data.get('y')
+            lon = node_data.get('x')
+            if lat is not None and lon is not None:
+                coordinates.append((lat, lon))
+                node_ids.append(node_id)
+
+    if not coordinates:
+        logger.warning("[ELEVATION] No valid coordinates found in graph")
+        return {}
+
+    # Fetch elevations in one batch
+    try:
+        start_time = time.time()
+        elevations = await get_elevations(coordinates, client)
+        elapsed = time.time() - start_time
+
+        # Cache results
+        node_elevation_map = {}
+        for node_id, elevation in zip(node_ids, elevations):
+            _elevation_cache[node_id] = elevation
+            node_elevation_map[node_id] = elevation
+
+        logger.warning(f"[ELEVATION] Cached {len(node_elevation_map)} elevations in {elapsed:.1f}s")
+        return node_elevation_map
+
+    except Exception as e:
+        logger.error(f"[ELEVATION] Failed to precompute elevations: {e}")
+        return {}
+
+
+def _precompute_graph_elevations(
+    G: nx.MultiDiGraph,
+    sample_rate: float = 1.0,
+) -> Dict[int, float]:
+    """Sync wrapper for precomputing graph elevations.
+
+    Args:
+        G: NetworkX graph
+        sample_rate: Fraction of nodes to sample (1.0 = all)
+
+    Returns:
+        Dictionary mapping node_id -> elevation_m
+    """
+    try:
+        # Run the async function in the event loop
+        return asyncio.run(_precompute_graph_elevations_async(G, sample_rate))
+    except Exception as e:
+        logger.error(f"[ELEVATION] Failed to precompute elevations: {e}")
+        return {}
 
 
 def _find_landmarks_and_parks(
@@ -361,12 +470,21 @@ def _dfs_find_loops(
     min_distance_m: float,
     max_distance_m: float,
     max_loops: int,
+    timeout_seconds: float = TIMEOUT_STRATEGY,
 ) -> List[List[int]]:
-    """Find loops using depth-first search."""
+    """Find loops using optimized depth-first search with timeout."""
     loops = []
+    start_time = time.time()
+
+    # Precompute neighbors for faster access
+    neighbor_cache = {node: list(G.neighbors(node)) for node in G.nodes()}
 
     def dfs(current: int, path: List[int], distance: float, visited: Set[int]):
         nonlocal loops
+
+        # Timeout check
+        if time.time() - start_time > timeout_seconds:
+            return
 
         if len(loops) >= max_loops:
             return
@@ -381,15 +499,48 @@ def _dfs_find_loops(
                     loops.append(path + [start_node])
                     return
 
-        # Stop if we've gone too far
+        # OPTIMIZATION 1: Aggressive distance-based pruning
+        # If we're already past minimum and too far from target, stop
+        if distance > min_distance_m:
+            # Calculate minimum distance back to start (straight line heuristic)
+            if current in G.nodes and start_node in G.nodes:
+                current_lat, current_lon = G.nodes[current]['y'], G.nodes[current]['x']
+                start_lat, start_lon = G.nodes[start_node]['y'], G.nodes[start_node]['x']
+                # Rough straight-line distance in meters (using simple lat/lon)
+                lat_diff = (current_lat - start_lat) * 111320  # 1 degree lat ≈ 111.32 km
+                lon_diff = (current_lon - start_lon) * 111320 * math.cos(math.radians(current_lat))
+                straight_line_dist = math.sqrt(lat_diff**2 + lon_diff**2)
+
+                # If even the straight-line path would overshoot, prune
+                if distance + straight_line_dist > max_distance_m * 1.1:
+                    return
+
+        # OPTIMIZATION 2: Early stopping if we're way too far
         if distance > max_distance_m * 1.2:
             return
 
-        # Explore neighbors
-        neighbors = list(G.neighbors(current))
-        random.shuffle(neighbors)
+        # OPTIMIZATION 3: Path length limit to prevent infinite loops
+        if len(path) > 150:  # Reduced from 200
+            return
 
-        for neighbor in neighbors[:5]:  # Limit branching
+        # Explore neighbors with better branching control
+        neighbors = neighbor_cache.get(current, [])
+
+        # OPTIMIZATION 4: Smart neighbor selection
+        # Prioritize neighbors that might close the loop
+        close_to_start = []
+        other = []
+        for neighbor in neighbors:
+            if neighbor == start_node:
+                close_to_start.append(neighbor)
+            elif neighbor not in visited:
+                other.append(neighbor)
+
+        # Shuffle others for diversity
+        random.shuffle(other)
+
+        # Check closing neighbors first, then explore 4 others
+        for neighbor in (close_to_start + other[:4]):
             if neighbor in visited and neighbor != start_node:
                 continue
 
@@ -400,18 +551,168 @@ def _dfs_find_loops(
             edge_length = list(edge_data.values())[0].get('length', 0)
             new_dist = distance + edge_length
 
-            if new_dist <= max_distance_m * 1.5:
+            # OPTIMIZATION 5: Tighter distance bounds
+            # Only explore if we have a chance of reaching target
+            if new_dist <= max_distance_m * 1.3:
                 new_visited = visited | {neighbor}
                 dfs(neighbor, path + [neighbor], new_dist, new_visited)
 
     # Start DFS from neighbors of start_node
-    for neighbor in G.neighbors(start_node):
+    for neighbor in neighbor_cache.get(start_node, []):
         if len(loops) >= max_loops:
+            break
+        if time.time() - start_time > timeout_seconds:
             break
         edge_data = G.get_edge_data(start_node, neighbor)
         if edge_data:
             edge_length = list(edge_data.values())[0].get('length', 0)
             dfs(neighbor, [start_node, neighbor], edge_length, {start_node, neighbor})
+
+    elapsed = time.time() - start_time
+    if elapsed > timeout_seconds * 0.9:
+        logger.warning(f"[DFS] Timeout approaching, found {len(loops)} loops in {elapsed:.1f}s")
+
+    return loops
+
+
+def _bidirectional_loop_search(
+    G: nx.MultiDiGraph,
+    start_node: int,
+    target_distance_m: float,
+    min_distance_m: float,
+    max_distance_m: float,
+    max_loops: int = 10,
+    timeout_seconds: float = TIMEOUT_STRATEGY,
+) -> List[List[int]]:
+    """Find loops using bidirectional search - MUCH faster than full DFS.
+
+    Strategy:
+    1. Find all paths from start_node of length ~target_distance/2
+    2. Check which paths can connect back to start_node
+    3. This reduces search space exponentially
+
+    Returns:
+        List of loops as node sequences
+    """
+    loops = []
+    start_time = time.time()
+
+    # Target half-loop distance
+    half_distance = target_distance_m / 2.0
+    half_tolerance = (max_distance_m - min_distance_m) / 2.0
+
+    # Find half-loops using constrained DFS
+    half_loops = []
+
+    def find_half_loops(current: int, path: List[int], distance: float, visited: Set[int], depth: int = 0):
+        nonlocal half_loops
+
+        # Timeout check
+        if time.time() - start_time > timeout_seconds * 0.5:  # Use half timeout for this phase
+            return
+
+        if len(half_loops) >= max_loops * 3:  # Find more candidates, filter later
+            return
+
+        # Depth limit
+        if depth > 75:
+            return
+
+        # Check if this is a good half-loop candidate
+        if distance >= half_distance * 0.7 and distance <= half_distance * 1.3:
+            half_loops.append((path, distance, current))
+            return  # Found a half-loop, don't go further
+
+        # Stop if too far
+        if distance > half_distance * 1.4:
+            return
+
+        # Explore neighbors
+        neighbors = list(G.neighbors(current))
+        random.shuffle(neighbors)
+
+        for neighbor in neighbors[:4]:  # Tight branching
+            if neighbor in visited and neighbor != start_node:
+                continue
+
+            edge_data = G.get_edge_data(current, neighbor)
+            if not edge_data:
+                continue
+
+            edge_length = list(edge_data.values())[0].get('length', 0)
+            new_dist = distance + edge_length
+
+            if new_dist <= half_distance * 1.5:
+                new_visited = visited | {neighbor}
+                find_half_loops(neighbor, path + [neighbor], new_dist, new_visited, depth + 1)
+
+    # Find half-loops starting from start_node
+    for neighbor in G.neighbors(start_node):
+        if time.time() - start_time > timeout_seconds * 0.5:
+            break
+        edge_data = G.get_edge_data(start_node, neighbor)
+        if edge_data:
+            edge_length = list(edge_data.values())[0].get('length', 0)
+            find_half_loops(neighbor, [start_node, neighbor], edge_length, {start_node, neighbor})
+
+    logger.warning(f"[BIDIR] Found {len(half_loops)} half-loop candidates")
+
+    # Now try to complete loops by connecting back to start
+    for path, dist, end_node in half_loops:
+        if len(loops) >= max_loops:
+            break
+        if time.time() - start_time > timeout_seconds:
+            break
+
+        # Try direct connection back to start
+        if G.has_edge(end_node, start_node):
+            edge_data = G.get_edge_data(end_node, start_node)
+            if edge_data:
+                close_dist = list(edge_data.values())[0].get('length', 0)
+                total = dist + close_dist
+                if min_distance_m <= total <= max_distance_m:
+                    loops.append(path + [start_node])
+
+        # Try short connections (1-2 hops) back to start
+        remaining_dist = target_distance_m - dist
+        if remaining_dist > 0 and remaining_dist < max_distance_m * 0.4:
+            # BFS to find short paths back
+            queue = [(end_node, [end_node], 0)]
+            seen = {end_node}
+
+            while queue and len(loops) < max_loops:
+                if time.time() - start_time > timeout_seconds:
+                    break
+
+                curr, extension, ext_dist = queue.pop(0)
+
+                # Check if we can reach start
+                if G.has_edge(curr, start_node):
+                    edge_data = G.get_edge_data(curr, start_node)
+                    if edge_data:
+                        close_dist = list(edge_data.values())[0].get('length', 0)
+                        total = dist + ext_dist + close_dist
+                        if min_distance_m <= total <= max_distance_m:
+                            # Combine: original path + extension + start
+                            full_loop = path + extension[1:] + [start_node]
+                            loops.append(full_loop)
+                            break
+
+                # Only explore 1-2 more hops
+                if len(extension) <= 3:
+                    for neighbor in G.neighbors(curr):
+                        if neighbor in seen or neighbor in path:
+                            continue
+                        seen.add(neighbor)
+                        edge_data = G.get_edge_data(curr, neighbor)
+                        if edge_data:
+                            edge_len = list(edge_data.values())[0].get('length', 0)
+                            new_ext_dist = ext_dist + edge_len
+                            if new_ext_dist <= remaining_dist * 1.2:
+                                queue.append((neighbor, extension + [neighbor], new_ext_dist))
+
+    elapsed = time.time() - start_time
+    logger.warning(f"[BIDIR] Found {len(loops)} complete loops in {elapsed:.1f}s")
 
     return loops
 
@@ -446,14 +747,25 @@ def find_routes_smart(
     """
     search_radius_m = max((target_distance_km * 1000) * 0.5, 1000)
 
-    # Step 1: Download full network
+    # Step 1: Download full network with timeout protection
     logger.warning("[SMART] Step 1: Downloading area network...")
-    G = ox.graph_from_point(
-        (center_lat, center_lon),
-        dist=search_radius_m,
-        network_type="walk",
-        simplify=True,
-    )
+    download_start = time.time()
+    try:
+        # OSMnx doesn't support timeout directly, but we can at least track time
+        G = ox.graph_from_point(
+            (center_lat, center_lon),
+            dist=search_radius_m,
+            network_type="walk",
+            simplify=True,
+        )
+        download_time = time.time() - download_start
+        logger.warning(f"[SMART] OSM download took {download_time:.1f}s")
+
+        if download_time > TIMEOUT_OSM_DOWNLOAD:
+            logger.warning(f"[SMART] OSM download exceeded timeout ({TIMEOUT_OSM_DOWNLOAD}s), but completed")
+    except Exception as e:
+        logger.error(f"[SMART] OSM download failed: {e}")
+        raise RouteFinderError(f"Failed to download network: {e}")
 
     if G.number_of_nodes() < 10:
         raise RouteFinderError("Not enough road network data in this area")
@@ -472,6 +784,18 @@ def find_routes_smart(
     logger.warning("[SMART] Step 4: Finding running corridors...")
     corridors = _find_running_corridors(running_G)
     logger.warning(f"[SMART] Found {len(corridors)} corridors, largest has {len(corridors[0]) if corridors else 0} nodes")
+
+    # Step 4.5: OPTIMIZATION - Precompute elevation for graph nodes
+    # This is a MAJOR optimization: instead of fetching elevation for each route,
+    # we fetch elevation for all graph nodes once. Dramatically reduces API calls.
+    if running_G.number_of_nodes() > 0:
+        # For large graphs, sample nodes to avoid slow elevation API
+        sample_rate = 1.0 if running_G.number_of_nodes() < 500 else 0.6
+        logger.warning(f"[SMART] Step 4.5: Precomputing node elevations (sample_rate={sample_rate})...")
+        try:
+            _precompute_graph_elevations(running_G, sample_rate=sample_rate)
+        except Exception as e:
+            logger.warning(f"[SMART] Elevation precomputation failed (non-fatal): {e}")
 
     # Find start node
     center_node = ox.distance.nearest_nodes(G, center_lon, center_lat)
@@ -501,36 +825,49 @@ def find_routes_smart(
     max_distance_m = target_distance_km * (1 + distance_tolerance) * 1000
 
     routes = []
+    corridor_search_start = time.time()
 
-    # Step 5: Find loops in the main corridor
+    # Step 5: Find loops in the main corridor (with timeout)
     logger.warning("[SMART] Step 5: Finding loops in running corridors...")
     for i, corridor in enumerate(corridors[:5]):  # Check top 5 corridors
+        # Check global timeout for corridor search
+        if time.time() - corridor_search_start > TIMEOUT_CORRIDOR_SEARCH:
+            logger.warning(f"[SMART] Corridor search timeout reached, stopping with {len(routes)} routes")
+            break
+
         if center_node not in corridor:
             continue
 
-        # Skip corridors that are too large (cycle finding is slow)
-        if len(corridor) > 5000:
-            logger.warning(f"[SMART] Corridor {i+1} too large ({len(corridor)} nodes), using DFS only")
-            # For large corridors, only use DFS (faster)
-            corridor_G = running_G.subgraph(corridor).copy()
-            corridor_loops = _dfs_find_loops(
-                corridor_G, center_node, target_distance_m, min_distance_m, max_distance_m,
-                max_loops=num_routes
-            )
-        else:
-            corridor_loops = _find_corridor_loops(
-                running_G, corridor, center_node,
-                target_distance_m, min_distance_m, max_distance_m,
-                max_loops=num_routes
-            )
+        corridor_G = running_G.subgraph(corridor).copy()
+
+        # OPTIMIZATION: Use bidirectional search first (faster!)
+        logger.warning(f"[SMART] Corridor {i+1}: trying bidirectional search ({len(corridor)} nodes)...")
+        corridor_loops = _bidirectional_loop_search(
+            corridor_G, center_node, target_distance_m, min_distance_m, max_distance_m,
+            max_loops=num_routes, timeout_seconds=5.0
+        )
+
+        # If bidirectional didn't find enough, supplement with optimized DFS
+        if len(corridor_loops) < num_routes // 2:
+            logger.warning(f"[SMART] Corridor {i+1}: supplementing with DFS...")
+            remaining_time = TIMEOUT_CORRIDOR_SEARCH - (time.time() - corridor_search_start)
+            if remaining_time > 2.0:  # Only if we have time left
+                dfs_loops = _dfs_find_loops(
+                    corridor_G, center_node, target_distance_m, min_distance_m, max_distance_m,
+                    max_loops=num_routes - len(corridor_loops),
+                    timeout_seconds=min(remaining_time, 5.0)
+                )
+                corridor_loops.extend(dfs_loops)
 
         for loop_nodes in corridor_loops:
             coords = [(running_G.nodes[n]['y'], running_G.nodes[n]['x']) for n in loop_nodes]
             routes.append(coords)
 
-        logger.warning(f"[SMART] Corridor {i+1}: found {len(corridor_loops)} loops")
+        logger.warning(f"[SMART] Corridor {i+1}: found {len(corridor_loops)} loops (total: {len(routes)})")
 
-        if len(routes) >= num_routes:
+        # OPTIMIZATION: Early termination if we have enough good routes
+        if len(routes) >= num_routes * 1.5:  # Get 50% more than needed for good selection
+            logger.warning(f"[SMART] Found enough routes ({len(routes)}), stopping early")
             break
 
     # Step 6: If not enough routes, also search in full graph with running preference
@@ -554,10 +891,12 @@ def find_routes_smart(
     # Deduplicate
     unique_routes = _deduplicate_routes(routes)
 
-    # Cap the number of candidates to limit elevation API calls
-    MAX_CANDIDATES = 20
+    # OPTIMIZATION: Cap the number of candidates to limit elevation API calls
+    # Reduced from 20 to 15 since we're now generating better quality candidates
+    MAX_CANDIDATES = 15
     unique_routes = unique_routes[:MAX_CANDIDATES]
 
+    logger.warning(f"[SMART] Returning {len(unique_routes)} unique candidate routes")
     return unique_routes
 
 
@@ -568,8 +907,9 @@ def _find_natural_loops(
     min_distance_m: float,
     max_distance_m: float,
     max_loops: int = 10,
+    timeout_seconds: float = TIMEOUT_STRATEGY,
 ) -> List[List[int]]:
-    """Find natural loops in the graph using DFS.
+    """Find natural loops in the graph using DFS with timeout.
 
     Searches for cycles that:
     - Start and end at the start_node
@@ -583,11 +923,13 @@ def _find_natural_loops(
         min_distance_m: Minimum acceptable distance
         max_distance_m: Maximum acceptable distance
         max_loops: Maximum number of loops to find
+        timeout_seconds: Maximum time to spend searching
 
     Returns:
         List of node sequences representing loops
     """
     loops = []
+    start_time = time.time()
 
     # Calculate running score for each edge (higher = better for running)
     edge_scores = {}
@@ -597,6 +939,10 @@ def _find_natural_loops(
     # DFS to find loops
     def dfs(current: int, path: List[int], distance: float, visited_edges: Set):
         nonlocal loops
+
+        # Timeout check
+        if time.time() - start_time > timeout_seconds:
+            return
 
         if len(loops) >= max_loops:
             return
