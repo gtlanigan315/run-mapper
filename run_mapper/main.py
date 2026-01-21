@@ -1,3 +1,4 @@
+
 """FastAPI application entry point for Run Mapper."""
 
 from fastapi import FastAPI
@@ -5,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from run_mapper import __version__
 from run_mapper.api.routes import router
+from run_mapper.api.strava import router as strava_router
 
 app = FastAPI(
     title="Run Mapper",
@@ -25,6 +27,7 @@ app.add_middleware(
 
 # Include API routes
 app.include_router(router, prefix="/api/v1", tags=["routes"])
+app.include_router(strava_router, prefix="/api/v1", tags=["strava"])
 
 
 @app.get("/")

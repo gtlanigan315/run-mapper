@@ -1,9 +1,18 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import RouteMap from './components/RouteMap';
 import ElevationChart from './components/ElevationChart';
 import RouteComparison from './components/RouteComparison';
 import AddressAutocomplete from './components/AddressAutocomplete';
-import { analyzeGpx, findRoutes } from './services/api';
+import {
+  analyzeGpx,
+  findRoutes,
+  getStravaAuthUrl,
+  exchangeStravaToken,
+  saveStravaTokens,
+  getStravaTokens,
+  clearStravaTokens,
+  getValidStravaToken,
+} from './services/api';
 import { ROUTE_COLORS } from './constants/colors';
 import './App.css';
 
@@ -68,6 +77,10 @@ function App() {
   const [location, setLocation] = useState('');
   const [gpxFile, setGpxFile] = useState(null);
   const [gpxProfile, setGpxProfile] = useState(null);
+
+  // Strava state
+  const [stravaConnected, setStravaConnected] = useState(false);
+  const [stravaLoading, setStravaLoading] = useState(false);
   const [manualDistance, setManualDistance] = useState(5);
   const [manualElevationGain, setManualElevationGain] = useState(50);
   const [manualGrade, setManualGrade] = useState('');
@@ -92,6 +105,70 @@ function App() {
 
     return () => clearInterval(interval);
   }, [loading]);
+
+  // Check for existing Strava tokens on mount
+  useEffect(() => {
+    const tokens = getStravaTokens();
+    if (tokens) {
+      setStravaConnected(true);
+    }
+  }, []);
+
+  // Handle Strava OAuth callback (use ref to prevent double execution in StrictMode)
+  const stravaCallbackHandled = useRef(false);
+  useEffect(() => {
+    const handleStravaCallback = async () => {
+      if (stravaCallbackHandled.current) return;
+
+      const urlParams = new URLSearchParams(window.location.search);
+      const code = urlParams.get('code');
+      const error = urlParams.get('error');
+
+      if (error) {
+        console.error('Strava OAuth error:', error);
+        // Clear the URL params
+        window.history.replaceState({}, document.title, window.location.pathname);
+        return;
+      }
+
+      if (code) {
+        stravaCallbackHandled.current = true;
+        setStravaLoading(true);
+        try {
+          const tokens = await exchangeStravaToken(code);
+          saveStravaTokens(tokens);
+          setStravaConnected(true);
+        } catch (err) {
+          console.error('Failed to exchange Strava token:', err);
+          setError('Failed to connect to Strava');
+          stravaCallbackHandled.current = false; // Allow retry on error
+        } finally {
+          setStravaLoading(false);
+          // Clear the URL params
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+      }
+    };
+
+    handleStravaCallback();
+  }, []);
+
+  const handleStravaConnect = async () => {
+    try {
+      setStravaLoading(true);
+      const authUrl = await getStravaAuthUrl();
+      window.location.href = authUrl;
+    } catch (err) {
+      console.error('Failed to get Strava auth URL:', err);
+      setError('Failed to connect to Strava. Make sure the backend is configured with Strava credentials.');
+      setStravaLoading(false);
+    }
+  };
+
+  const handleStravaDisconnect = () => {
+    clearStravaTokens();
+    setStravaConnected(false);
+  };
 
   const handleGpxChange = async (e) => {
     const file = e.target.files[0];
@@ -126,7 +203,7 @@ function App() {
       return;
     }
 
-    let distance, elevationGain;
+    let distance, elevationGain, elevationLoss, profile;
 
     if (inputMode === 'gpx') {
       if (!gpxProfile) {
@@ -135,8 +212,12 @@ function App() {
       }
       distance = gpxProfile.distance_km;
       elevationGain = gpxProfile.elevation_gain_m;
+      elevationLoss = gpxProfile.elevation_loss_m;
+      profile = gpxProfile.profile;
     } else {
       distance = manualDistance;
+      elevationLoss = 0;
+      profile = null;
       // If grade is provided, calculate elevation gain from grade and distance
       if (manualGrade && !isNaN(parseFloat(manualGrade))) {
         elevationGain = (parseFloat(manualGrade) / 100) * (distance * 1000);
@@ -151,8 +232,15 @@ function App() {
     setSelectedRoute(null);
 
     try {
-      console.log('Searching for routes...', { location, distance, elevationGain });
-      const response = await findRoutes(location, distance, elevationGain, 5);
+      console.log('Searching for routes...', { location, distance, elevationGain, elevationLoss, stravaConnected });
+
+      // Get Strava token if connected
+      let stravaToken = null;
+      if (stravaConnected) {
+        stravaToken = await getValidStravaToken();
+      }
+
+      const response = await findRoutes(location, distance, elevationGain, 5, stravaToken, elevationLoss, profile);
       console.log('Routes found:', response);
 
       if (!response.routes || response.routes.length === 0) {
@@ -241,7 +329,27 @@ function App() {
     <div className="app">
       <header className="app-header">
         <h1>Run Mapper</h1>
-        <p>Find training routes that match your race elevation profile</p>
+        <div className="header-actions">
+          {stravaConnected ? (
+            <button
+              className="strava-btn connected"
+              onClick={handleStravaDisconnect}
+              disabled={stravaLoading}
+            >
+              <span className="strava-icon">S</span>
+              Strava Connected
+            </button>
+          ) : (
+            <button
+              className="strava-btn"
+              onClick={handleStravaConnect}
+              disabled={stravaLoading}
+            >
+              <span className="strava-icon">S</span>
+              {stravaLoading ? 'Connecting...' : 'Connect Strava'}
+            </button>
+          )}
+        </div>
       </header>
 
       <main className="app-main">
@@ -389,19 +497,33 @@ function App() {
             <div className="results-section">
               <h3>Matching Routes</h3>
               <div className="routes-list">
-                {routes.map((route, index) => (
+                {routes.map((route, index) => {
+                  const routeColor = ROUTE_COLORS[index % ROUTE_COLORS.length];
+                  const isSelected = selectedRoute === index;
+                  return (
                   <div
                     key={index}
-                    className={`route-card ${selectedRoute === index ? 'selected' : ''}`}
+                    className={`route-card ${isSelected ? 'selected' : ''}`}
                     onClick={() => handleRouteSelect(index)}
-                    style={{ borderLeftColor: ROUTE_COLORS[index % ROUTE_COLORS.length] }}
+                    style={{
+                      borderLeftColor: routeColor,
+                      ...(isSelected && {
+                        backgroundColor: `${routeColor}20`,
+                        borderColor: `${routeColor}66`,
+                      }),
+                    }}
                   >
                     <div className="route-header">
                       <span
                         className="route-color"
-                        style={{ backgroundColor: ROUTE_COLORS[index % ROUTE_COLORS.length] }}
+                        style={{ backgroundColor: routeColor }}
                       />
                       <span className="route-name">{route.name}</span>
+                      {(route.source === 'strava' || route.source === 'strava-weighted') && (
+                        <span className="strava-badge">
+                          {route.source === 'strava' ? 'Strava' : 'Popular'}
+                        </span>
+                      )}
                       <span className="match-score">
                         {(route.similarity_score * 100).toFixed(0)}% match
                       </span>
@@ -431,7 +553,8 @@ function App() {
                       )}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

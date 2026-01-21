@@ -1,6 +1,6 @@
 """Pydantic models for API request/response schemas."""
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -24,7 +24,16 @@ class FindRoutesRequest(BaseModel):
     location: str = Field(..., description="Location to search for routes (e.g., 'Boston, MA')")
     target_distance_km: float = Field(..., gt=0, description="Target route distance in kilometers")
     target_elevation_gain_m: float = Field(..., ge=0, description="Target elevation gain in meters")
+    target_elevation_loss_m: float = Field(default=0, ge=0, description="Target elevation loss in meters")
+    target_profile: Optional[List[List[float]]] = Field(
+        default=None,
+        description="Target elevation profile as [[km, elevation_m], ...] for shape matching"
+    )
     num_results: int = Field(default=5, ge=1, le=20, description="Number of routes to return")
+    strava_access_token: Optional[str] = Field(
+        default=None,
+        description="Strava access token for fetching popular segments"
+    )
 
 
 class RouteResult(BaseModel):
@@ -38,6 +47,10 @@ class RouteResult(BaseModel):
     coordinates: List[List[float]] = Field(..., description="Route coordinates as [[lat, lon], ...]")
     profile: List[List[float]] = Field(
         ..., description="Elevation profile as [[km, elevation_m], ...]"
+    )
+    source: str = Field(
+        default="generated",
+        description="Route source: 'strava' for Strava segments, 'generated' for algorithm-generated"
     )
 
 
