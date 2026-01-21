@@ -1,0 +1,27 @@
+services:
+  # Backend API
+  - type: web
+    name: run-mapper-api
+    env: python
+    buildCommand: "pip install poetry && poetry install"
+    startCommand: "poetry run uvicorn run_mapper.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.16
+      - key: POETRY_VERSION
+        value: 1.7.1
+    healthCheckPath: /docs
+
+  # Frontend Static Site
+  - type: web
+    name: run-mapper-frontend
+    env: static
+    buildCommand: "cd frontend && npm install && npm run build"
+    staticPublishPath: ./frontend/dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
