@@ -85,6 +85,7 @@ def parse_gpx(gpx_content: Union[str, bytes]) -> ElevationProfile:
 
     # Calculate elevation metrics
     elevations = [p[2] for p in points]
+    distances = [p[3] for p in points]  # cumulative distances in km
     elevation_gain = 0.0
     elevation_loss = 0.0
 
@@ -94,6 +95,36 @@ def parse_gpx(gpx_content: Union[str, bytes]) -> ElevationProfile:
             elevation_gain += diff
         else:
             elevation_loss += abs(diff)
+
+    # Find steepest climb (minimum 100m distance to count as sustained)
+    steepest_climb_grade = 0.0
+    steepest_climb_distance_m = 0.0
+    steepest_climb_gain_m = 0.0
+    min_climb_distance_km = 0.1  # 100 meters minimum
+
+    for i in range(len(points)):
+        start_dist_km = distances[i]
+        start_elev = elevations[i]
+
+        for j in range(i + 1, len(points)):
+            end_dist_km = distances[j]
+            end_elev = elevations[j]
+
+            segment_distance_km = end_dist_km - start_dist_km
+            if segment_distance_km < min_climb_distance_km:
+                continue
+
+            elev_change = end_elev - start_elev
+            if elev_change <= 0:
+                continue  # Not a climb
+
+            # Calculate grade as percentage
+            grade = (elev_change / (segment_distance_km * 1000)) * 100
+
+            if grade > steepest_climb_grade:
+                steepest_climb_grade = grade
+                steepest_climb_distance_m = segment_distance_km * 1000
+                steepest_climb_gain_m = elev_change
 
     # Create profile data: [[km, elevation_m], ...]
     profile = [[round(p[3], 3), round(p[2], 1)] for p in points]
@@ -105,6 +136,9 @@ def parse_gpx(gpx_content: Union[str, bytes]) -> ElevationProfile:
         min_elevation_m=round(min(elevations), 1),
         max_elevation_m=round(max(elevations), 1),
         profile=profile,
+        steepest_climb_grade=round(steepest_climb_grade, 1),
+        steepest_climb_distance_m=round(steepest_climb_distance_m, 1),
+        steepest_climb_gain_m=round(steepest_climb_gain_m, 1),
     )
 
 

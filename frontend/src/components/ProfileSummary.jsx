@@ -23,6 +23,22 @@ function ProfileSummary({ profile }) {
           <span className="stat-value">{profile.min_elevation_m.toFixed(0)} - {profile.max_elevation_m.toFixed(0)}</span>
           <span className="stat-label">Elevation Range (m)</span>
         </div>
+        {profile.steepest_climb_grade > 0 && (
+          <>
+            <div className="stat-box">
+              <span className="stat-value">{profile.steepest_climb_grade.toFixed(1)}%</span>
+              <span className="stat-label">Steepest Grade</span>
+            </div>
+            <div className="stat-box">
+              <span className="stat-value">{profile.steepest_climb_distance_m.toFixed(0)}m</span>
+              <span className="stat-label">Climb Distance</span>
+            </div>
+            <div className="stat-box">
+              <span className="stat-value">+{profile.steepest_climb_gain_m.toFixed(0)}m</span>
+              <span className="stat-label">Climb Gain</span>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

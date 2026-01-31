@@ -16,6 +16,10 @@ class ElevationProfile(BaseModel):
     profile: List[List[float]] = Field(
         ..., description="Elevation profile as [[km, elevation_m], ...]"
     )
+    # Steepest climb metrics
+    steepest_climb_grade: float = Field(default=0.0, description="Steepest climb grade as percentage")
+    steepest_climb_distance_m: float = Field(default=0.0, description="Distance of steepest climb in meters")
+    steepest_climb_gain_m: float = Field(default=0.0, description="Elevation gain of steepest climb in meters")
 
 
 class FindRoutesRequest(BaseModel):

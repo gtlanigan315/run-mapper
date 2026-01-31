@@ -725,14 +725,13 @@ def find_routes_smart(
     distance_tolerance: float = 0.15,
     popular_paths: Optional[List[List[Tuple[float, float]]]] = None,
 ) -> List[List[Tuple[float, float]]]:
-    """Find running routes using the smart area-first approach.
+    """Find running routes using fast waypoint-based generation.
 
     This approach:
     1. Downloads the OSM network
-    2. Extracts only running-quality paths (trails, quiet streets)
-    3. Identifies running corridors (connected networks of good paths)
-    4. Finds loops within these corridors
-    5. Incorporates Strava segment data to prefer popular routes
+    2. Applies Strava popularity weighting (if available)
+    3. Generates routes by picking waypoints and connecting with shortest_path
+    4. Returns diverse candidates for elevation scoring
 
     Args:
         center_lat: Center latitude
@@ -746,157 +745,115 @@ def find_routes_smart(
         List of routes as coordinate lists
     """
     search_radius_m = max((target_distance_km * 1000) * 0.5, 1000)
+    start_time = time.time()
 
-    # Step 1: Download full network with timeout protection
-    logger.warning("[SMART] Step 1: Downloading area network...")
-    download_start = time.time()
+    # Step 1: Download OSM network
+    logger.warning("[FAST] Step 1: Downloading area network...")
     try:
-        # OSMnx doesn't support timeout directly, but we can at least track time
         G = ox.graph_from_point(
             (center_lat, center_lon),
             dist=search_radius_m,
             network_type="walk",
             simplify=True,
         )
-        download_time = time.time() - download_start
-        logger.warning(f"[SMART] OSM download took {download_time:.1f}s")
-
-        if download_time > TIMEOUT_OSM_DOWNLOAD:
-            logger.warning(f"[SMART] OSM download exceeded timeout ({TIMEOUT_OSM_DOWNLOAD}s), but completed")
+        logger.warning(f"[FAST] Downloaded {G.number_of_nodes()} nodes in {time.time() - start_time:.1f}s")
     except Exception as e:
-        logger.error(f"[SMART] OSM download failed: {e}")
         raise RouteFinderError(f"Failed to download network: {e}")
 
     if G.number_of_nodes() < 10:
         raise RouteFinderError("Not enough road network data in this area")
 
-    # Step 2: Extract running-quality network (only trails, paths - not residential)
-    logger.warning("[SMART] Step 2: Extracting running-quality paths...")
-    running_G = _extract_running_network(G, min_score=0.8)
-    logger.warning(f"[SMART] Running network: {running_G.number_of_nodes()} nodes, {running_G.number_of_edges()} edges")
-
-    # Step 3: Apply Strava popularity weighting if available
+    # Step 2: Apply Strava popularity weighting (if available)
     if popular_paths:
-        logger.warning("[SMART] Step 3: Applying Strava popularity data...")
-        running_G = _apply_popularity_weights(running_G, popular_paths)
-
-    # Step 4: Find running corridors
-    logger.warning("[SMART] Step 4: Finding running corridors...")
-    corridors = _find_running_corridors(running_G)
-    logger.warning(f"[SMART] Found {len(corridors)} corridors, largest has {len(corridors[0]) if corridors else 0} nodes")
-
-    # Step 4.5: OPTIMIZATION - Precompute elevation for graph nodes
-    # This is a MAJOR optimization: instead of fetching elevation for each route,
-    # we fetch elevation for all graph nodes once. Dramatically reduces API calls.
-    if running_G.number_of_nodes() > 0:
-        # For large graphs, sample nodes to avoid slow elevation API
-        sample_rate = 1.0 if running_G.number_of_nodes() < 500 else 0.6
-        logger.warning(f"[SMART] Step 4.5: Precomputing node elevations (sample_rate={sample_rate})...")
-        try:
-            _precompute_graph_elevations(running_G, sample_rate=sample_rate)
-        except Exception as e:
-            logger.warning(f"[SMART] Elevation precomputation failed (non-fatal): {e}")
+        logger.warning("[FAST] Step 2: Applying Strava popularity weights...")
+        G = _apply_popularity_weights(G, popular_paths)
 
     # Find start node
     center_node = ox.distance.nearest_nodes(G, center_lon, center_lat)
 
-    # Try to find start node in running network, or find nearest
-    if center_node not in running_G.nodes():
-        # Find nearest node that is in the running network
-        min_dist = float('inf')
-        nearest_running_node = None
-        center_coords = (center_lat, center_lon)
-        for node in running_G.nodes():
-            node_lat = running_G.nodes[node]['y']
-            node_lon = running_G.nodes[node]['x']
-            dist = ((node_lat - center_lat)**2 + (node_lon - center_lon)**2)**0.5
-            if dist < min_dist:
-                min_dist = dist
-                nearest_running_node = node
-        if nearest_running_node:
-            center_node = nearest_running_node
-        else:
-            logger.warning("[SMART] Could not find start node in running network, falling back")
-            return find_candidate_routes(center_lat, center_lon, target_distance_km, num_routes, distance_tolerance, popular_paths)
-
     # Distance bounds
     target_distance_m = target_distance_km * 1000
-    min_distance_m = target_distance_km * (1 - distance_tolerance) * 1000
-    max_distance_m = target_distance_km * (1 + distance_tolerance) * 1000
+    min_distance_km = target_distance_km * (1 - distance_tolerance)
+    max_distance_km = target_distance_km * (1 + distance_tolerance)
 
     routes = []
-    corridor_search_start = time.time()
+    weight_attr = _get_routing_weight(G)
 
-    # Step 5: Find loops in the main corridor (with timeout)
-    logger.warning("[SMART] Step 5: Finding loops in running corridors...")
-    for i, corridor in enumerate(corridors[:5]):  # Check top 5 corridors
-        # Check global timeout for corridor search
-        if time.time() - corridor_search_start > TIMEOUT_CORRIDOR_SEARCH:
-            logger.warning(f"[SMART] Corridor search timeout reached, stopping with {len(routes)} routes")
-            break
+    # Step 3: Generate routes using FAST waypoint-based approach
+    logger.warning("[FAST] Step 3: Generating waypoint-based routes...")
 
-        if center_node not in corridor:
+    # Strategy A: Directional loops (8 compass directions)
+    for direction in [0, 45, 90, 135, 180, 225, 270, 315]:
+        route = _generate_directional_loop(
+            G, center_node, center_lat, center_lon,
+            target_distance_km, min_distance_km, max_distance_km,
+            direction, direction_spread=30
+        )
+        if route:
+            routes.append(route)
+
+    logger.warning(f"[FAST] Directional loops: {len(routes)} routes")
+
+    # Strategy B: Out-and-back routes (6 directions)
+    for direction in [0, 60, 120, 180, 240, 300]:
+        route = _generate_out_and_back(
+            G, center_node, center_lat, center_lon,
+            target_distance_km, min_distance_km, max_distance_km,
+            direction
+        )
+        if route:
+            routes.append(route)
+
+    logger.warning(f"[FAST] After out-and-back: {len(routes)} routes")
+
+    # Strategy C: Figure-8 routes (4 directions)
+    for direction in [0, 45, 90, 135]:
+        route = _generate_figure_eight(
+            G, center_node, center_lat, center_lon,
+            target_distance_km, min_distance_km, max_distance_km,
+            direction
+        )
+        if route:
+            routes.append(route)
+
+    logger.warning(f"[FAST] After figure-8: {len(routes)} routes")
+
+    # Strategy D: Random multi-waypoint loops (for diversity)
+    attempts = 0
+    while len(routes) < 20 and attempts < 10:
+        attempts += 1
+        try:
+            route = _generate_random_loop(
+                G, center_node, target_distance_km, min_distance_km, max_distance_km
+            )
+            if route:
+                routes.append(route)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
             continue
 
-        corridor_G = running_G.subgraph(corridor).copy()
+    logger.warning(f"[FAST] After random loops: {len(routes)} routes")
 
-        # OPTIMIZATION: Use bidirectional search first (faster!)
-        logger.warning(f"[SMART] Corridor {i+1}: trying bidirectional search ({len(corridor)} nodes)...")
-        corridor_loops = _bidirectional_loop_search(
-            corridor_G, center_node, target_distance_m, min_distance_m, max_distance_m,
-            max_loops=num_routes, timeout_seconds=5.0
+    # Strategy E: Strava-weighted loops (if we have Strava data)
+    if popular_paths:
+        strava_routes = _generate_popular_path_loops(
+            G, center_node, center_lat, center_lon,
+            target_distance_km, min_distance_km, max_distance_km,
+            popular_paths
         )
+        routes.extend(strava_routes)
+        logger.warning(f"[FAST] After Strava loops: {len(routes)} routes")
 
-        # If bidirectional didn't find enough, supplement with optimized DFS
-        if len(corridor_loops) < num_routes // 2:
-            logger.warning(f"[SMART] Corridor {i+1}: supplementing with DFS...")
-            remaining_time = TIMEOUT_CORRIDOR_SEARCH - (time.time() - corridor_search_start)
-            if remaining_time > 2.0:  # Only if we have time left
-                dfs_loops = _dfs_find_loops(
-                    corridor_G, center_node, target_distance_m, min_distance_m, max_distance_m,
-                    max_loops=num_routes - len(corridor_loops),
-                    timeout_seconds=min(remaining_time, 5.0)
-                )
-                corridor_loops.extend(dfs_loops)
-
-        for loop_nodes in corridor_loops:
-            coords = [(running_G.nodes[n]['y'], running_G.nodes[n]['x']) for n in loop_nodes]
-            routes.append(coords)
-
-        logger.warning(f"[SMART] Corridor {i+1}: found {len(corridor_loops)} loops (total: {len(routes)})")
-
-        # OPTIMIZATION: Early termination if we have enough good routes
-        if len(routes) >= num_routes * 1.5:  # Get 50% more than needed for good selection
-            logger.warning(f"[SMART] Found enough routes ({len(routes)}), stopping early")
-            break
-
-    # Step 6: If not enough routes, also search in full graph with running preference
-    if len(routes) < num_routes // 2:
-        logger.warning("[SMART] Step 6: Supplementing with weighted full-graph search...")
-        supplemental = _find_natural_loops(
-            G, center_node, target_distance_m, min_distance_m, max_distance_m,
-            max_loops=num_routes - len(routes)
-        )
-        for loop_nodes in supplemental:
-            coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in loop_nodes]
-            routes.append(coords)
-
-    logger.warning(f"[SMART] Total routes found: {len(routes)}")
+    elapsed = time.time() - start_time
+    logger.warning(f"[FAST] Generated {len(routes)} routes in {elapsed:.1f}s")
 
     if not routes:
-        # Fall back to original approach
-        logger.warning("[SMART] No routes found, falling back to original approach")
-        return find_candidate_routes(center_lat, center_lon, target_distance_km, num_routes, distance_tolerance, popular_paths)
+        raise RouteFinderError("Could not generate any valid routes in this area")
 
-    # Deduplicate
+    # Deduplicate and cap
     unique_routes = _deduplicate_routes(routes)
+    unique_routes = unique_routes[:15]  # Cap for elevation API
 
-    # OPTIMIZATION: Cap the number of candidates to limit elevation API calls
-    # Reduced from 20 to 15 since we're now generating better quality candidates
-    MAX_CANDIDATES = 15
-    unique_routes = unique_routes[:MAX_CANDIDATES]
-
-    logger.warning(f"[SMART] Returning {len(unique_routes)} unique candidate routes")
+    logger.warning(f"[FAST] Returning {len(unique_routes)} unique routes")
     return unique_routes
 
 
